@@ -1,5 +1,5 @@
 #include "utils.hpp"
-#include "fft.hpp"
+#include "fft/fft.hpp"
 #include <opencv2/opencv.hpp>
 #include <iostream>
 using namespace cv;
@@ -33,7 +33,8 @@ int main(int argc, char** argv) {
         Mat channel = channels[i];
         if (usePowerOf2) channel = autoPadToPowerOfTwo(channel);
 
-        channels[i] = wienerDeblur_myfft(channel, psf, K);
+        // todo: change namespace to fft_simd or others to test different implementations
+        channels[i] = fft_simd::wienerDeblur_myfft(channel, psf, K);
 
         if (usePowerOf2) channels[i] = channels[i](Rect(0, 0, img.cols, img.rows));
     }
