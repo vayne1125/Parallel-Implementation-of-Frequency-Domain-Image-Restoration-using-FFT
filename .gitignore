@@ -1,0 +1,26 @@
+# 編譯產生檔案
+*.o
+*.obj
+*.exe
+*.out
+*.log
+
+# 編譯目標
+fft_image_restoration
+
+# 自動產生的臨時檔案
+*.tmp
+*.temp
+*.swp
+*~
+
+# VSCode / JetBrains / IDE 設定檔
+.vscode/
+.idea/
+*.iml
+
+# macOS 特有
+.DS_Store
+
+# OpenCV / OpenCV extra build outputs
+build/
