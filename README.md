@@ -7,21 +7,42 @@
 ```sh
 clone https://github.com/vayne1125/Parallel-Implementation-of-Frequency-Domain-Image-Restoration-using-FFT.git
 cd Parallel-Implementation-of-Frequency-Domain-Image-Restoration-using-FFT
-make
-# ./fft_image_restoration <img-path> <psf-length> <psf-angle>
-./fft_image_restoration "./input/cat_blurred.png" 50 30 
-./fft_image_restoration "./input/car_blurred.png" 40 45
+make MODE=parallel
+# ./parallel <img-path> <psf-length> <psf-angle>
+./parallel "./input/cat_blurred.png" 50 30 
+./parallel "./input/car_blurred.png" 40 45
 ```
 
 ### Change parallel mode
-- using different namespace to change the mode
-- `fft_parallel(all parallel mode)` mode is default option
-```cpp
-// in main.cpp line 37
-// use serial
-channels[i] = fft_serial::wienerDeblur_myfft(channel, psf, K);
-// use simd
-channels[i] = fft_simd::wienerDeblur_myfft(channel, psf, K);
-// etc.
-channels[i] = fft_xxxx::wienerDeblur_myfft(channel, psf, K);
+- serial
+- simd
+- openmp
+- mpi
+- parallel(fastest)
+
+#### SERIAL
+```sh
+make MODE=serial
+# ./serial <img-path> <psf-length> <psf-angle>
+./serial "./input/cat_blurred.png" 50 30 
+```
+
+#### SIMD
+```sh
+make MODE=simd
+# todo
+```
+
+#### OpenMP
+```sh
+make MODE=openmp
+# todo
+./openmp "./input/cat_blurred.png" 50 30
+```
+
+#### MPI
+```sh
+make MODE=mpi
+# mpirun -np <num_procs> ./mpi <img-path> <psf-length> <psf-angle>
+mpirun -np 4 ./mpi "./input/cat_blurred.png" 50 30
 ```
