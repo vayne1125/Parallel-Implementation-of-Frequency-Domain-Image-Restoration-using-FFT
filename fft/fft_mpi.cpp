@@ -3,6 +3,7 @@
 #include <opencv2/opencv.hpp>
 #include <complex>
 #include <vector>
+#include <mpi.h>
 using namespace cv;
 using namespace std;
 
@@ -80,108 +81,227 @@ void transform_row_inplace(Vec2f* rowPtr, int N, bool inverse)
     }
 }
 
-// 2D separable transform: row-wise FFT, transpose, row-wise FFT, transpose back
-// works in-place on CV_32FC2 Mat
-// inverse: false = forward DFT, true = inverse DFT (no scaling)
-void my_dft2D(Mat& complexMat, bool inverse)
+void calculate_distribution(int total_items, int size, vector<int>& counts, vector<int>& displs)
 {
-    CV_Assert(complexMat.type() == CV_32FC2);
+    counts.assign(size, total_items / size);
+    int remainder = total_items % size;
+    for (int i = 0; i < remainder; ++i) {
+        counts[i]++;
+    }
+    displs[0] = 0;
+    for (int i = 1; i < size; ++i) {
+        displs[i] = displs[i - 1] + counts[i - 1];
+    }
+}
+void distributed_transpose(Mat& localMat, int global_rows, int global_cols)
+{
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    int M = complexMat.rows;
-    int N = complexMat.cols;
+    // 1) Row distribution
+    vector<int> row_counts(size), row_displs(size);
+    calculate_distribution(global_rows, size, row_counts, row_displs);
+    int local_rows = row_counts[rank];
 
-    // 1) row-wise transform (each row length N)
-    for (int r = 0; r < M; ++r) {
-        Vec2f* rowPtr = complexMat.ptr<Vec2f>(r);
-        transform_row_inplace(rowPtr, N, inverse);
+    //  2) Column distribution(row distribution after transpose)
+    vector<int> col_counts(size), col_displs(size);
+    calculate_distribution(global_cols, size, col_counts, col_displs);
+    int new_local_rows = col_counts[rank];
+
+    // 3) Prepare send buffer
+    vector<float> send_buf(local_rows * global_cols * 2);
+    vector<int> send_counts(size), send_displs(size);
+    int buf_idx = 0;
+
+    for (int p = 0; p < size; ++p) {
+        send_displs[p] = buf_idx;
+        int p_cols_count = col_counts[p];
+        int p_col_start = col_displs[p];
+        
+        for (int r = 0; r < local_rows; ++r) {
+            const float* ptr = localMat.ptr<float>(r);
+            for (int c = 0; c < p_cols_count; ++c) {
+                int global_c = p_col_start + c;
+                send_buf[buf_idx++] = ptr[global_c * 2];
+                send_buf[buf_idx++] = ptr[global_c * 2 + 1];
+            }
+        }
+        send_counts[p] = buf_idx - send_displs[p];
+    }
+    // 4) Prepare recv buffer
+    vector<float> recv_buf(new_local_rows * global_rows * 2);
+    vector<int> recv_counts(size), recv_displs(size);
+    int recv_offset = 0;
+    for (int p = 0; p < size; ++p) {
+        recv_counts[p] = row_counts[p] * new_local_rows * 2;
+        recv_displs[p] = recv_offset;
+        recv_offset += recv_counts[p];
     }
 
-    // 2) transpose
-    Mat t;
-    transpose(complexMat, t); // now size: N x M
+    // 5) All-to-all communication
+    MPI_Alltoallv(send_buf.data(), send_counts.data(), send_displs.data(), MPI_FLOAT,
+                  recv_buf.data(), recv_counts.data(), recv_displs.data(), MPI_FLOAT,
+                  MPI_COMM_WORLD);
+    
+    // 6) Write back to localMat
+    localMat = Mat::zeros(new_local_rows, global_rows, CV_32FC2);
 
-    // 3) row-wise transform on transposed (each row length M)
-    for (int r = 0; r < t.rows; ++r) {
-        Vec2f* rowPtr = t.ptr<Vec2f>(r);
-        transform_row_inplace(rowPtr, t.cols, inverse);
+    int current_idx = 0;
+    int global_row_start = 0;
+    for (int p = 0; p < size; ++p) {
+        int src_rows = row_counts[p];
+        for (int r = 0; r < src_rows; ++r) {
+            for (int c = 0; c < new_local_rows; ++c) {
+                float re = recv_buf[current_idx++];
+                float im = recv_buf[current_idx++];
+                localMat.at<Vec2f>(c, global_row_start + r) = Vec2f(re, im);
+            }
+        }
+        global_row_start += src_rows;
     }
-
-    // 4) transpose back into original
-    transpose(t, complexMat);
 
 }
 
+// 2D separable transform: row-wise FFT, transpose, row-wise FFT, transpose back
+// works in-place on CV_32FC2 Mat
+// inverse: false = forward DFT, true = inverse DFT (no scaling)
+void my_dft2D(Mat& complexMat, int global_rows, int global_cols, bool inverse)
+{
+    CV_Assert(complexMat.type() == CV_32FC2);
+    
+    // 1) Row-wise transform (Local)
+    for (int r = 0; r < complexMat.rows; ++r) {
+        Vec2f* rowPtr = complexMat.ptr<Vec2f>(r);
+        transform_row_inplace(rowPtr, global_cols, inverse);
+    }
+
+    // 2) Distributed transpose
+    distributed_transpose(complexMat, global_rows, global_cols);
+    
+    // 3) Column-wise transform (Local)
+    for (int r = 0; r < complexMat.rows; ++r) {
+        Vec2f* rowPtr = complexMat.ptr<Vec2f>(r);
+        transform_row_inplace(rowPtr, global_rows, inverse);
+    }
+
+    // 4) Distributed transpose back
+    distributed_transpose(complexMat, global_cols, global_rows);
+}
+
+
+
 Mat wienerDeblur_myfft(const Mat& img, const Mat& psf, float K) {
-    Mat padded;
-    int optRows = getOptimalDFTSize(img.rows);
-    int optCols = getOptimalDFTSize(img.cols);
-    copyMakeBorder(img, padded, 0, optRows - img.rows, 0, optCols - img.cols, BORDER_CONSTANT, Scalar::all(0));
+    // MPI
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    Mat planes[] = {padded, Mat::zeros(padded.size(), CV_32F)};
-    Mat complexI;
-    merge(planes, 2, complexI);            // CV_32FC2
-    my_dft2D_forward(complexI);            // <--- 使用自製 FFT (2D)
+    int global_rows, global_cols, orig_rows, orig_cols;
 
-    // PSF
-    Mat psfPadded;
-    copyMakeBorder(psf, psfPadded, 0, optRows - psf.rows, 0, optCols - psf.cols, BORDER_CONSTANT, Scalar::all(0));
-    Mat psfPlanes[] = {psfPadded, Mat::zeros(psfPadded.size(), CV_32F)};
-    Mat psfComplex;
-    merge(psfPlanes, 2, psfComplex);
-    my_dft2D_forward(psfComplex);          // <--- 使用自製 FFT (2D)
+    // 1) Rank 0
+    if (rank == 0) {
+        orig_rows = img.rows;
+        orig_cols = img.cols;
+        global_rows = getOptimalDFTSize(orig_rows);
+        global_cols = getOptimalDFTSize(orig_cols);
+    }
+    MPI_Bcast(&global_rows, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&global_cols, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&orig_rows, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&orig_cols, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    // denom = |H|^2 + K
-    Mat denom;
-    // mulSpectrums(psfComplex, psfComplex, denom, 0, true);
-    // Implement |H|^2 manually (real^2 + imag^2) in single-channel float
-    Mat planesH[2];
-    split(psfComplex, planesH);
-    Mat mag2;
-    magnitude(planesH[0], planesH[1], mag2); // sqrt(re^2+im^2)
-    // mag2 currently = sqrt(|H|^2), so square it:
-    mag2 = mag2.mul(mag2); // now |H|^2
-    denom = mag2 + Scalar::all(K);
+    vector<int> row_counts(size), row_displs(size);
+    calculate_distribution(global_rows, size, row_counts, row_displs);
+    int local_rows = row_counts[rank];
 
-    // psf conjugate
-    planesH[1] = -planesH[1];
-    Mat psfConj;
-    merge(planesH, 2, psfConj);
+    // 2) Prepare local image Mat
+    Mat local_complex_img(local_rows, global_cols, CV_32FC2);
+    Mat local_complex_psf(local_rows, global_cols, CV_32FC2);
 
-    // numerator = G * H_conj
-    Mat numerator;
-    // complex multiply: (a+ib)*(c+id) = (ac - bd) + i(ad + bc)
-    {
-        Mat A[2], B[2], C[2];
-        split(complexI, A); split(psfConj, B);
-        C[0] = A[0].mul(B[0]) - A[1].mul(B[1]);
-        C[1] = A[0].mul(B[1]) + A[1].mul(B[0]);
-        merge(C, 2, numerator);
+    vector<float> send_buf_img, send_buf_psf;
+    vector<int> scats(size), displs(size);
+
+    if (rank == 0) {
+        Mat padded_img, padded_psf;
+        copyMakeBorder(img, padded_img, 0, global_rows - img.rows, 0, global_cols - img.cols, BORDER_CONSTANT, Scalar::all(0));
+        copyMakeBorder(psf, padded_psf, 0, global_rows - psf.rows, 0, global_cols - psf.cols, BORDER_CONSTANT, Scalar::all(0));
+        
+        Mat planes[] = {padded_img, Mat::zeros(padded_img.size(), CV_32F)};
+        Mat complex_img_full;
+        merge(planes, 2, complex_img_full);
+
+        Mat psf_planes[] = {padded_psf, Mat::zeros(padded_psf.size(), CV_32F)};
+        Mat complex_psf_full;
+        merge(psf_planes, 2, complex_psf_full);
+        
+        // Prepare send buffers for scattering
+        send_buf_img.assign((float*)complex_img_full.datastart, (float*)complex_img_full.dataend);
+        send_buf_psf.assign((float*)complex_psf_full.datastart, (float*)complex_psf_full.dataend);
+
+        for (int i = 0; i < size; ++i) {
+            scats[i] = row_counts[i] * global_cols * 2;
+            displs[i] = row_displs[i] * global_cols * 2;
+        }
+    }
+    // Scatter image and PSF to all processes
+    MPI_Scatterv(rank == 0 ? send_buf_img.data() : NULL, scats.data(), displs.data(), MPI_FLOAT,
+                 local_complex_img.ptr<float>(), local_rows * global_cols * 2, MPI_FLOAT,
+                 0, MPI_COMM_WORLD);
+
+    MPI_Scatterv(rank == 0 ? send_buf_psf.data() : NULL, scats.data(), displs.data(), MPI_FLOAT,
+                 local_complex_psf.ptr<float>(), local_rows * global_cols * 2, MPI_FLOAT,
+                 0, MPI_COMM_WORLD);
+
+    // 3) Forward DFT on local data
+    my_dft2D(local_complex_img, global_rows, global_cols, false);
+    my_dft2D(local_complex_psf, global_rows, global_cols, false);
+
+    // 4) Compute |H|^2 + K (denominator) and H_conj
+    // H (PSF), G (Image) -> F = G * (conj(H) / (|H|^2 + K))
+    for (int r = 0; r < local_rows; ++r) {
+        Vec2f* rowG = local_complex_img.ptr<Vec2f>(r);
+        Vec2f* rowH = local_complex_psf.ptr<Vec2f>(r);
+        for (int c = 0; c < global_cols; ++c) {
+            complex<float> G(rowG[c][0], rowG[c][1]);
+            complex<float> H(rowH[c][0], rowH[c][1]);
+
+            float mag2 = norm(H); // |H|^2
+            complex<float> H_conj = conj(H);
+            complex<float> val = G * (H_conj / (mag2 + K));
+
+            rowG[c][0] = val.real();
+            rowG[c][1] = val.imag();
+        }
     }
 
-    // divide by denom (real scalar per frequency): result = numerator / denom
-    Mat result = Mat::zeros(numerator.size(), numerator.type());
-    {
-        Mat numPlanes[2], outP[2];
-        split(numerator, numPlanes);
-        outP[0] = numPlanes[0] / denom;
-        outP[1] = numPlanes[1] / denom;
-        merge(outP, 2, result);
+    // 5) Inverse DFT on local data
+    my_dft2D(local_complex_img, global_rows, global_cols, true);
+
+    // 6) Gather results to rank 0
+    Mat finalRestored;
+    if (rank == 0) {
+        finalRestored = Mat::zeros(global_rows, global_cols, CV_32FC2);
     }
 
-    // inverse 2D transform
-    my_dft2D_inverse(result); // <--- 使用自製 IDFT (2D)
-    // NOTE: our inverse does NOT scale; OpenCV idft default also does not scale unless DFT_SCALE used.
-    // If you want scaled inverse (so result is real-space amplitude), scale by 1/(optRows*optCols)
-    Mat restoredPlanes[2];
-    split(result, restoredPlanes);
-    Mat restored = restoredPlanes[0];
+    MPI_Gatherv(local_complex_img.ptr<float>(), local_rows * global_cols * 2, MPI_FLOAT,
+                rank == 0 ? (float*)finalRestored.data : NULL, scats.data(), displs.data(), MPI_FLOAT,
+                0, MPI_COMM_WORLD);
+    
+    // 7) Rank 0: extract real part and crop to original size
+    if (rank == 0) {
+        Mat full_restored = finalRestored;
+        
+        vector<Mat> planes;
+        split(full_restored, planes);
+        Mat restored = planes[0];
+        restored /= (float)(global_rows * global_cols);
 
-    // crop to original size
-    Mat finalRestored = restored(Rect(0, 0, img.cols, img.rows)).clone();
-
-    // normalize for display (optional)
-    normalize(finalRestored, finalRestored, 0, 1, NORM_MINMAX);
-
+        // Crop
+        finalRestored = restored(Rect(0, 0, orig_cols, orig_rows)).clone();
+        normalize(finalRestored, finalRestored, 0, 1, NORM_MINMAX);
+        
+    }
     return finalRestored;
 }
 }
