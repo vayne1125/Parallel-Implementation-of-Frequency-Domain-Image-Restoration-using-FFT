@@ -9,7 +9,7 @@ ifeq ($(MODE), mpi)
     SRC = mpi.cpp fft/fft_mpi.cpp fft/fft_serial.cpp
 else ifeq ($(MODE), simd)
     CXX = g++
-    CXXFLAGS += -mavx2
+    CXXFLAGS += -mavx2 -mfma
     TARGET = simd
     SRC = simd.cpp fft/fft_simd.cpp fft/fft_serial.cpp
 else ifeq ($(MODE), openmp)
