@@ -1,0 +1,97 @@
+#include "utils.hpp"
+#include "fft/fft.hpp"
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <mpi.h>
+using namespace cv;
+using namespace std;
+using namespace std::chrono;
+
+int main(int argc, char** argv) {
+    // Initialize MPI
+    MPI_Init(&argc, &argv);
+    
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    if (argc != 4) {
+        if (rank == 0) {
+            cout << "Compile: mpicxx mpi.cpp ./fft/fft_mpi.cpp `pkg-config --cflags --libs opencv4`\n";
+            cout << "Usage: mpirun -np <num_procs> ./mpi <img-path> <psf-length> <psf-angle>\n";
+        }
+        MPI_Finalize();
+        return -1;
+    }
+    string img_path = argv[1];
+    int psf_length = atoi(argv[2]);
+    double psf_angle = atof(argv[3]);
+
+    bool usePowerOf2 = true; 
+
+    // Only rank 0 reads image and prepares data
+    Mat img, psf;
+    float K = 0.01f;
+    vector<Mat> channels;
+    
+    if (rank == 0) {
+        img = imread(img_path, IMREAD_COLOR);
+        if (img.empty()) { 
+            cout << "Cannot read image\n"; 
+            MPI_Abort(MPI_COMM_WORLD, -1);
+        }
+        img.convertTo(img, CV_32F);
+        img /= 255.0;
+
+        psf = motionBlurKernel(psf_length, psf_angle);
+        split(img, channels);
+    }
+
+    auto t_start = high_resolution_clock::now();
+    
+    // All processes call wienerDeblur_myfft
+    // Rank 0 sends data and receives results
+    // Workers receive data, process, and send back
+    if (rank == 0) {
+        for (int i = 0; i < 3; i++) {
+            Mat channel = channels[i];
+            if (usePowerOf2) channel = autoPadToPowerOfTwo(channel);
+
+            channels[i] = fft_mpi::wienerDeblur_myfft(channel, psf, K);
+
+            if (usePowerOf2) channels[i] = channels[i](Rect(0, 0, img.cols, img.rows));
+        }
+    } else {
+        // Workers participate in processing for each channel
+        for (int i = 0; i < 3; i++) {
+            fft_mpi::wienerDeblur_myfft(Mat(), Mat(), K);
+        }
+    }
+    
+    auto t_end = high_resolution_clock::now();
+    
+    
+    // Only rank 0 displays results
+    if (rank == 0) {
+
+        cout << "Deblurring 3 channels took: " << getElapsedMs(t_start, t_end) << " ms\n";
+        Mat merged_float;
+        merge(channels, merged_float);
+
+        Mat merged_Lab, img_orig_Lab;
+        cvtColor(merged_float, merged_Lab, COLOR_BGR2Lab);
+        cvtColor(img, img_orig_Lab, COLOR_BGR2Lab);
+
+        Mat corrected_Lab = applyWhiteBalance(merged_Lab, img_orig_Lab);
+
+        Mat corrected_BGR;
+        cvtColor(corrected_Lab, corrected_BGR, COLOR_Lab2BGR);
+        corrected_BGR.convertTo(corrected_BGR, CV_8U, 255.0);
+
+        imshow("Deblurred Color Image", corrected_BGR);
+        waitKey(0);
+    }
+    
+    MPI_Finalize();
+    return 0;
+}
