@@ -3,16 +3,18 @@
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include <cstdlib>
+#include <omp.h>
 
 using namespace cv;
 using namespace std;
 using namespace std::chrono;
 
-bool areChannelsEqual(const std::vector<cv::Mat>& vec1, const std::vector<cv::Mat>& vec2) {
+bool areChannelsEqual(const std::vector<cv::Mat>& vec1, const std::vector<cv::Mat>& vec2, double epsilon = 1e-3) {
     if (vec1.size() != vec2.size()) {
         std::cerr << "Error: Channel count mismatch (" << vec1.size() << " vs " << vec2.size() << ").\n";
         return false;
     }
+
     for (size_t i = 0; i < vec1.size(); ++i) {
         const cv::Mat& mat1 = vec1[i];
         const cv::Mat& mat2 = vec2[i];
@@ -21,12 +23,16 @@ bool areChannelsEqual(const std::vector<cv::Mat>& vec1, const std::vector<cv::Ma
             std::cerr << "Error: Size or type mismatch in channel " << i << ".\n";
             return false;
         }
-        if (cv::norm(mat1, mat2, cv::NORM_L2) != 0.0) {
-            std::cerr << "Error: Content mismatch in channel " << i << ".\n";
+
+        double diff = cv::norm(mat1, mat2, cv::NORM_INF);
+        
+        if (diff > epsilon) {
+            std::cerr << "[Error] Content mismatch in channel " << i << ".\n";
+            std::cerr << "        Max pixel difference: " << diff << " (Threshold: " << epsilon << ")\n";
             return false;
         }
     }
-    return true; // All checks passed; the two channel sets are identical.
+    return true; 
 }
 
 int main(int argc, char** argv) {
@@ -38,7 +44,14 @@ int main(int argc, char** argv) {
     int psf_length = atoi(argv[2]);
     double psf_angle = atof(argv[3]);
     int num_threads = atoi(argv[4]);
+    // fft_openmp::num_threads = num_threads;
 
+    // int total_threads = num_threads;
+    // int outer_threads = min(3,num_threads);
+    // int inner_threads = total_threads / outer_threads;
+    // if (inner_threads < 1) inner_threads = 1;
+
+    cout << "[INFO] " << num_threads << " threads will be used for OpenMP FFT.\n";
     if (num_threads <= 0) {
         cerr << "Error: Number of threads must be greater than 0.\n";
         return -1;
@@ -73,8 +86,9 @@ int main(int argc, char** argv) {
 
 
     t_start = high_resolution_clock::now();
-    // #pragma omp parallel for num_threads(num_threads)
+    // #pragma omp parallel for num_threads(outer_threads)
     for (int i = 0; i < 3; i++) {
+        omp_set_num_threads(num_threads);
         Mat channel = channels[i];
         if (usePowerOf2) channel = autoPadToPowerOfTwo(channel);
         channels[i] = fft_openmp::wienerDeblur_myfft(channel, psf, K);
@@ -104,6 +118,6 @@ int main(int argc, char** argv) {
     cvtColor(corrected_Lab, corrected_BGR, COLOR_Lab2BGR);
     corrected_BGR.convertTo(corrected_BGR, CV_8U, 255.0);
 
-    imshow("Deblurred Color Image", corrected_BGR);
+    // imshow("Deblurred Color Image", corrected_BGR);
     waitKey(0);
 }

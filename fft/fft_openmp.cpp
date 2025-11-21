@@ -5,8 +5,27 @@
 #include <vector>
 using namespace cv;
 using namespace std;
+using namespace std::chrono;
 
 namespace fft_openmp {
+// ============================================================
+// CPU Timer Helper
+// ============================================================
+struct CpuTimer {
+    string name;
+    high_resolution_clock::time_point start;
+
+    CpuTimer(string n) : name(n) {
+        start = high_resolution_clock::now();
+    }
+
+    ~CpuTimer() {
+        auto end = high_resolution_clock::now();
+        auto duration = duration_cast<microseconds>(end - start).count();
+        cout << "[" << name << "] Time: " << duration / 1000.0 << " ms" << endl;
+    }
+};
+
 // iterative radix-2 Cooley-Tukey FFT (in-place)
 // a: vector of complex<float>, n must be power-of-two
 // inverse: if true compute inverse transform (no scaling)
@@ -62,21 +81,61 @@ void dft_naive_inplace(vector<complex<float>>& a, bool inverse)
 // perform 1D transform on a single row (CV_32FC2) length = N
 void transform_row_inplace(Vec2f* rowPtr, int N, bool inverse)
 {
-    // copy to complex buffer
-    vector<complex<float>> buf;
-    buf.reserve(N);
+    // 使用 thread_local 避免重複 malloc
+    static thread_local vector<complex<float>> buf;
+    
+    if (buf.size() != N) {
+        buf.resize(N);
+    }
+
+    complex<float>* bufPtr = buf.data();
     for (int x = 0; x < N; ++x) {
-        Vec2f v = rowPtr[x];
-        buf.emplace_back(v[0], v[1]);
+        bufPtr[x] = {rowPtr[x][0], rowPtr[x][1]};
     }
 
     if (isPowerOfTwo(N)) fft_radix2_inplace(buf, inverse);
     else dft_naive_inplace(buf, inverse);
 
-    // write back
     for (int x = 0; x < N; ++x) {
-        rowPtr[x][0] = buf[x].real();
-        rowPtr[x][1] = buf[x].imag();
+        rowPtr[x][0] = bufPtr[x].real();
+        rowPtr[x][1] = bufPtr[x].imag();
+    }
+}
+
+// Parallel Transpose with Tiling (Block-based) optimization
+// src: M x N, dst: N x M
+void transpose_parallel(const Mat& src, Mat& dst) {
+    int M = src.rows;
+    int N = src.cols;
+
+    // Allocate destination matrix (N x M)
+    dst.create(N, M, src.type());
+
+    // Block size for cache locality (tuning parameter, usually 16 or 32)
+    const int BLOCK_SIZE = 32;
+
+    // Parallelize over row blocks of the SOURCE matrix
+    #pragma omp parallel for collapse(2)
+    for (int i = 0; i < M; i += BLOCK_SIZE) {
+        for (int j = 0; j < N; j += BLOCK_SIZE) {
+            
+            // Handle boundary conditions (if matrix size is not multiple of BLOCK_SIZE)
+            int iEnd = std::min(i + BLOCK_SIZE, M);
+            int jEnd = std::min(j + BLOCK_SIZE, N);
+
+            // Process the block
+            for (int row = i; row < iEnd; ++row) {
+                // Pre-calculate pointers for speed
+                const Vec2f* srcRowPtr = src.ptr<Vec2f>(row);
+                
+                for (int col = j; col < jEnd; ++col) {
+                    // Transpose: dst(col, row) = src(row, col)
+                    // Note: Writing to dst is scattered (strided), reading from src is sequential
+                    // inside this small block, cache misses are minimized.
+                    dst.ptr<Vec2f>(col)[row] = srcRowPtr[col];
+                }
+            }
+        }
     }
 }
 
@@ -91,6 +150,7 @@ void my_dft2D(Mat& complexMat, bool inverse)
     int N = complexMat.cols;
 
     // 1) row-wise transform (each row length N)
+    #pragma omp parallel for
     for (int r = 0; r < M; ++r) {
         Vec2f* rowPtr = complexMat.ptr<Vec2f>(r);
         transform_row_inplace(rowPtr, N, inverse);
@@ -98,89 +158,113 @@ void my_dft2D(Mat& complexMat, bool inverse)
 
     // 2) transpose
     Mat t;
-    transpose(complexMat, t); // now size: N x M
+    transpose_parallel(complexMat, t);
 
     // 3) row-wise transform on transposed (each row length M)
+    #pragma omp parallel for
     for (int r = 0; r < t.rows; ++r) {
         Vec2f* rowPtr = t.ptr<Vec2f>(r);
         transform_row_inplace(rowPtr, t.cols, inverse);
     }
 
     // 4) transpose back into original
-    transpose(t, complexMat);
+    transpose_parallel(t, complexMat);
+}
 
+void makeComplexPadded(const Mat& src, Mat& dst, int optRows, int optCols) {
+    dst = Mat::zeros(optRows, optCols, CV_32FC2);
+
+    int rows = src.rows;
+    int cols = src.cols;
+
+    #pragma omp parallel for
+    for (int i = 0; i < rows; ++i) {
+        const float* srcPtr = src.ptr<float>(i);
+        Vec2f* dstPtr = dst.ptr<Vec2f>(i);
+        for (int j = 0; j < cols; ++j) {
+            dstPtr[j][0] = srcPtr[j]; 
+            dstPtr[j][1] = 0.0f; 
+        }
+    }
 }
 
 Mat wienerDeblur_myfft(const Mat& img, const Mat& psf, float K) {
-    Mat padded;
     int optRows = getOptimalDFTSize(img.rows);
     int optCols = getOptimalDFTSize(img.cols);
-    copyMakeBorder(img, padded, 0, optRows - img.rows, 0, optCols - img.cols, BORDER_CONSTANT, Scalar::all(0));
 
-    Mat planes[] = {padded, Mat::zeros(padded.size(), CV_32F)};
-    Mat complexI;
-    merge(planes, 2, complexI);            // CV_32FC2
-    my_dft2D_forward(complexI);            // <--- 使用自製 FFT (2D)
-
-    // PSF
-    Mat psfPadded;
-    copyMakeBorder(psf, psfPadded, 0, optRows - psf.rows, 0, optCols - psf.cols, BORDER_CONSTANT, Scalar::all(0));
-    Mat psfPlanes[] = {psfPadded, Mat::zeros(psfPadded.size(), CV_32F)};
-    Mat psfComplex;
-    merge(psfPlanes, 2, psfComplex);
-    my_dft2D_forward(psfComplex);          // <--- 使用自製 FFT (2D)
-
-    // denom = |H|^2 + K
-    Mat denom;
-    // mulSpectrums(psfComplex, psfComplex, denom, 0, true);
-    // Implement |H|^2 manually (real^2 + imag^2) in single-channel float
-    Mat planesH[2];
-    split(psfComplex, planesH);
-    Mat mag2;
-    magnitude(planesH[0], planesH[1], mag2); // sqrt(re^2+im^2)
-    // mag2 currently = sqrt(|H|^2), so square it:
-    mag2 = mag2.mul(mag2); // now |H|^2
-    denom = mag2 + Scalar::all(K);
-
-    // psf conjugate
-    planesH[1] = -planesH[1];
-    Mat psfConj;
-    merge(planesH, 2, psfConj);
-
-    // numerator = G * H_conj
-    Mat numerator;
-    // complex multiply: (a+ib)*(c+id) = (ac - bd) + i(ad + bc)
+    // 1. 準備資料 (Padding)
+    Mat complexI, psfComplex;
     {
-        Mat A[2], B[2], C[2];
-        split(complexI, A); split(psfConj, B);
-        C[0] = A[0].mul(B[0]) - A[1].mul(B[1]);
-        C[1] = A[0].mul(B[1]) + A[1].mul(B[0]);
-        merge(C, 2, numerator);
+        CpuTimer t("OpenMP: Prep & Padding");
+        // 這裡包含了 makeComplexPadded 的邏輯
+        makeComplexPadded(img, complexI, optRows, optCols);
+
+        Mat psfPadded;
+        makeComplexPadded(psf, psfComplex, optRows, optCols);
     }
 
-    // divide by denom (real scalar per frequency): result = numerator / denom
-    Mat result = Mat::zeros(numerator.size(), numerator.type());
+    // 2. Forward FFT (Image)
     {
-        Mat numPlanes[2], outP[2];
-        split(numerator, numPlanes);
-        outP[0] = numPlanes[0] / denom;
-        outP[1] = numPlanes[1] / denom;
-        merge(outP, 2, result);
+        CpuTimer t("OpenMP: FFT Image");
+        my_dft2D_forward(complexI);
     }
 
-    // inverse 2D transform
-    my_dft2D_inverse(result); // <--- 使用自製 IDFT (2D)
-    // NOTE: our inverse does NOT scale; OpenCV idft default also does not scale unless DFT_SCALE used.
-    // If you want scaled inverse (so result is real-space amplitude), scale by 1/(optRows*optCols)
-    Mat restoredPlanes[2];
-    split(result, restoredPlanes);
-    Mat restored = restoredPlanes[0];
+    // 3. Forward FFT (PSF)
+    {
+        CpuTimer t("OpenMP: FFT PSF");
+        my_dft2D_forward(psfComplex);
+    }
 
-    // crop to original size
-    Mat finalRestored = restored(Rect(0, 0, img.cols, img.rows)).clone();
+    // 4. Wiener Filter Calculation
+    {
+        CpuTimer t("OpenMP: Wiener Filter");
+        int rows = complexI.rows;
+        int cols = complexI.cols;
 
-    // normalize for display (optional)
-    normalize(finalRestored, finalRestored, 0, 1, NORM_MINMAX);
+        #pragma omp parallel for
+        for (int i = 0; i < rows; ++i) {
+            Vec2f* ptrG = complexI.ptr<Vec2f>(i);
+            const Vec2f* ptrH = psfComplex.ptr<Vec2f>(i);
+
+            for (int j = 0; j < cols; ++j) {
+                float Gr = ptrG[j][0]; float Gi = ptrG[j][1];
+                float Hr = ptrH[j][0]; float Hi = ptrH[j][1];
+
+                float mag2 = Hr * Hr + Hi * Hi;
+                float denom = mag2 + K;
+                float invDenom = (denom > 1e-8f) ? (1.0f / denom) : 0.0f;
+
+                float numRe = Gr * Hr + Gi * Hi;
+                float numIm = Gi * Hr - Gr * Hi;
+
+                ptrG[j][0] = numRe * invDenom;
+                ptrG[j][1] = numIm * invDenom;
+            }
+        }
+    }
+
+    // 5. Inverse FFT
+    {
+        CpuTimer t("OpenMP: IFFT");
+        my_dft2D_inverse(complexI);
+    }
+
+    Mat finalRestored;
+    // 6. Post-processing
+    {
+        CpuTimer t("OpenMP: Post-process");
+        finalRestored = Mat(img.rows, img.cols, CV_32F);
+        
+        #pragma omp parallel for
+        for(int i = 0; i < img.rows; ++i) {
+            const Vec2f* srcPtr = complexI.ptr<Vec2f>(i);
+            float* dstPtr = finalRestored.ptr<float>(i);
+            for(int j = 0; j < img.cols; ++j) {
+                dstPtr[j] = srcPtr[j][0];
+            }
+        }
+        normalize(finalRestored, finalRestored, 0, 1, NORM_MINMAX);
+    }
 
     return finalRestored;
 }

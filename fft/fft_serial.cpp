@@ -7,6 +7,22 @@ using namespace cv;
 using namespace std;
 
 namespace fft_serial {
+
+struct CpuTimer {
+    string name;
+    high_resolution_clock::time_point start;
+
+    CpuTimer(string n) : name(n) {
+        start = high_resolution_clock::now();
+    }
+
+    ~CpuTimer() {
+        auto end = high_resolution_clock::now();
+        auto duration = duration_cast<microseconds>(end - start).count();
+        cout << "[" << name << "] Time: " << duration / 1000.0 << " ms" << endl;
+    }
+};
+
 // iterative radix-2 Cooley-Tukey FFT (in-place)
 // a: vector of complex<float>, n must be power-of-two
 // inverse: if true compute inverse transform (no scaling)
@@ -112,75 +128,106 @@ void my_dft2D(Mat& complexMat, bool inverse)
 }
 
 Mat wienerDeblur_myfft(const Mat& img, const Mat& psf, float K) {
-    Mat padded;
+    // 變數宣告移到區塊外，以便跨區塊使用
+    Mat complexI;
+    Mat psfComplex;
+    Mat result;
+    
     int optRows = getOptimalDFTSize(img.rows);
     int optCols = getOptimalDFTSize(img.cols);
-    copyMakeBorder(img, padded, 0, optRows - img.rows, 0, optCols - img.cols, BORDER_CONSTANT, Scalar::all(0));
 
-    Mat planes[] = {padded, Mat::zeros(padded.size(), CV_32F)};
-    Mat complexI;
-    merge(planes, 2, complexI);            // CV_32FC2
-    my_dft2D_forward(complexI);            // <--- 使用自製 FFT (2D)
-
-    // PSF
-    Mat psfPadded;
-    copyMakeBorder(psf, psfPadded, 0, optRows - psf.rows, 0, optCols - psf.cols, BORDER_CONSTANT, Scalar::all(0));
-    Mat psfPlanes[] = {psfPadded, Mat::zeros(psfPadded.size(), CV_32F)};
-    Mat psfComplex;
-    merge(psfPlanes, 2, psfComplex);
-    my_dft2D_forward(psfComplex);          // <--- 使用自製 FFT (2D)
-
-    // denom = |H|^2 + K
-    Mat denom;
-    // mulSpectrums(psfComplex, psfComplex, denom, 0, true);
-    // Implement |H|^2 manually (real^2 + imag^2) in single-channel float
-    Mat planesH[2];
-    split(psfComplex, planesH);
-    Mat mag2;
-    magnitude(planesH[0], planesH[1], mag2); // sqrt(re^2+im^2)
-    // mag2 currently = sqrt(|H|^2), so square it:
-    mag2 = mag2.mul(mag2); // now |H|^2
-    denom = mag2 + Scalar::all(K);
-
-    // psf conjugate
-    planesH[1] = -planesH[1];
-    Mat psfConj;
-    merge(planesH, 2, psfConj);
-
-    // numerator = G * H_conj
-    Mat numerator;
-    // complex multiply: (a+ib)*(c+id) = (ac - bd) + i(ad + bc)
+    // 1. 前處理 (Prep & Padding)
     {
-        Mat A[2], B[2], C[2];
-        split(complexI, A); split(psfConj, B);
-        C[0] = A[0].mul(B[0]) - A[1].mul(B[1]);
-        C[1] = A[0].mul(B[1]) + A[1].mul(B[0]);
-        merge(C, 2, numerator);
+        CpuTimer t("Serial: Pre-process");
+        
+        // Image Padding & Merge
+        Mat padded;
+        copyMakeBorder(img, padded, 0, optRows - img.rows, 0, optCols - img.cols, BORDER_CONSTANT, Scalar::all(0));
+        Mat planes[] = {padded, Mat::zeros(padded.size(), CV_32F)};
+        merge(planes, 2, complexI); // CV_32FC2
+
+        // PSF Padding & Merge
+        Mat psfPadded;
+        copyMakeBorder(psf, psfPadded, 0, optRows - psf.rows, 0, optCols - psf.cols, BORDER_CONSTANT, Scalar::all(0));
+        Mat psfPlanes[] = {psfPadded, Mat::zeros(psfPadded.size(), CV_32F)};
+        merge(psfPlanes, 2, psfComplex);
     }
 
-    // divide by denom (real scalar per frequency): result = numerator / denom
-    Mat result = Mat::zeros(numerator.size(), numerator.type());
+    // 2. FFT Image
     {
-        Mat numPlanes[2], outP[2];
-        split(numerator, numPlanes);
-        outP[0] = numPlanes[0] / denom;
-        outP[1] = numPlanes[1] / denom;
-        merge(outP, 2, result);
+        CpuTimer t("Serial: FFT Image");
+        my_dft2D_forward(complexI); // <--- 使用自製 FFT (2D)
     }
 
-    // inverse 2D transform
-    my_dft2D_inverse(result); // <--- 使用自製 IDFT (2D)
-    // NOTE: our inverse does NOT scale; OpenCV idft default also does not scale unless DFT_SCALE used.
-    // If you want scaled inverse (so result is real-space amplitude), scale by 1/(optRows*optCols)
-    Mat restoredPlanes[2];
-    split(result, restoredPlanes);
-    Mat restored = restoredPlanes[0];
+    // 3. FFT PSF
+    {
+        CpuTimer t("Serial: FFT PSF");
+        my_dft2D_forward(psfComplex); // <--- 使用自製 FFT (2D)
+    }
 
-    // crop to original size
-    Mat finalRestored = restored(Rect(0, 0, img.cols, img.rows)).clone();
+    // 4. Wiener Filter Calculation (原始矩陣操作版)
+    {
+        CpuTimer t("Serial: Wiener Filter");
+        
+        // denom = |H|^2 + K
+        Mat denom;
+        Mat planesH[2];
+        split(psfComplex, planesH);
+        
+        Mat mag2;
+        magnitude(planesH[0], planesH[1], mag2); // sqrt(re^2+im^2)
+        mag2 = mag2.mul(mag2); // now |H|^2
+        denom = mag2 + Scalar::all(K);
 
-    // normalize for display (optional)
-    normalize(finalRestored, finalRestored, 0, 1, NORM_MINMAX);
+        // psf conjugate
+        planesH[1] = -planesH[1];
+        Mat psfConj;
+        merge(planesH, 2, psfConj);
+
+        // numerator = G * H_conj
+        Mat numerator;
+        // complex multiply: (a+ib)*(c+id) = (ac - bd) + i(ad + bc)
+        {
+            Mat A[2], B[2], C[2];
+            split(complexI, A); split(psfConj, B);
+            C[0] = A[0].mul(B[0]) - A[1].mul(B[1]);
+            C[1] = A[0].mul(B[1]) + A[1].mul(B[0]);
+            merge(C, 2, numerator);
+        }
+
+        // divide by denom (real scalar per frequency): result = numerator / denom
+        result = Mat::zeros(numerator.size(), numerator.type());
+        {
+            Mat numPlanes[2], outP[2];
+            split(numerator, numPlanes);
+            outP[0] = numPlanes[0] / denom;
+            outP[1] = numPlanes[1] / denom;
+            merge(outP, 2, result);
+        }
+    }
+
+    // 5. Inverse FFT
+    {
+        CpuTimer t("Serial: IFFT");
+        my_dft2D_inverse(result); // <--- 使用自製 IDFT (2D)
+    }
+
+    Mat finalRestored;
+
+    // 6. 後處理 (Post-process)
+    {
+        CpuTimer t("Serial: Post-process");
+        
+        Mat restoredPlanes[2];
+        split(result, restoredPlanes);
+        Mat restored = restoredPlanes[0];
+
+        // crop to original size
+        finalRestored = restored(Rect(0, 0, img.cols, img.rows)).clone();
+
+        // normalize for display (optional)
+        normalize(finalRestored, finalRestored, 0, 1, NORM_MINMAX);
+    }
 
     return finalRestored;
 }
