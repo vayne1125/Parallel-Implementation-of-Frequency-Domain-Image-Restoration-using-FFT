@@ -17,7 +17,6 @@ int main(int argc, char** argv) {
 
     if (argc != 4) {
         if (rank == 0) {
-            cout << "Compile: mpicxx mpi.cpp ./fft/fft_mpi.cpp `pkg-config --cflags --libs opencv4`\n";
             cout << "Usage: mpirun -np <num_procs> ./mpi <img-path> <psf-length> <psf-angle>\n";
         }
         MPI_Finalize();
@@ -32,6 +31,7 @@ int main(int argc, char** argv) {
     // Only rank 0 reads image and prepares data
     Mat img, psf;
     float K = 0.01f;
+    vector<Mat> serial_channels;
     vector<Mat> channels;
     
     if (rank == 0) {
@@ -45,13 +45,27 @@ int main(int argc, char** argv) {
 
         psf = motionBlurKernel(psf_length, psf_angle);
         split(img, channels);
+        split(img, serial_channels);
     }
 
-    auto t_start = high_resolution_clock::now();
+    auto t_start_serial = high_resolution_clock::now();
+    if (rank == 0) {
+        
+        for (int i = 0; i < 3; i++) {
+            Mat channel = serial_channels[i];
+            if (usePowerOf2) channel = autoPadToPowerOfTwo(channel);
+            serial_channels[i] = fft_serial::wienerDeblur_myfft(channel, psf, K);
+            if (usePowerOf2) serial_channels[i] = serial_channels[i](Rect(0, 0, img.cols, img.rows));
+        }
+        
+    }
+    auto t_end_serial = high_resolution_clock::now();
+
     
     // All processes call wienerDeblur_myfft
     // Rank 0 sends data and receives results
     // Workers receive data, process, and send back
+    auto t_start_mpi = high_resolution_clock::now();
     if (rank == 0) {
         for (int i = 0; i < 3; i++) {
             Mat channel = channels[i];
@@ -67,14 +81,17 @@ int main(int argc, char** argv) {
             fft_mpi::wienerDeblur_myfft(Mat(), Mat(), K);
         }
     }
-    
-    auto t_end = high_resolution_clock::now();
+    auto t_end_mpi = high_resolution_clock::now();
     
     
     // Only rank 0 displays results
     if (rank == 0) {
 
-        cout << "Deblurring 3 channels took: " << getElapsedMs(t_start, t_end) << " ms\n";
+        auto serial_time = getElapsedMs(t_start_serial, t_end_serial);
+        cout << "Deblurring 3 channels took (serial) : " << serial_time << " ms\n";
+        auto mpi_time = getElapsedMs(t_start_mpi, t_end_mpi);
+        cout << "Deblurring 3 channels took (mpi): " << mpi_time << " ms\n";
+        
         Mat merged_float;
         merge(channels, merged_float);
 
