@@ -7,6 +7,8 @@ using namespace std;
 using namespace std::chrono;
 
 int main(int argc, char** argv) {
+    auto total_start = high_resolution_clock::now();
+
     if (argc != 4) {
         cout << "Usage: ./fft_image_restoration <img-path> <psf-length> <psf-angle>\n";
         return -1;
@@ -50,6 +52,9 @@ int main(int argc, char** argv) {
     Mat corrected_BGR;
     cvtColor(corrected_Lab, corrected_BGR, COLOR_Lab2BGR);
     corrected_BGR.convertTo(corrected_BGR, CV_8U, 255.0);
+
+    auto total_end = high_resolution_clock::now();
+    cout << "Total program time: " << getElapsedMs(total_start, total_end) << " ms\n";
 
     imshow("Deblurred Color Image", corrected_BGR);
     waitKey(0);
