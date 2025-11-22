@@ -3,23 +3,34 @@
 #include <opencv2/opencv.hpp>
 #include <complex>
 #include <vector>
+#include <map>
+#include <string>
 using namespace cv;
 using namespace std;
 
 namespace fft_serial {
 
+static int callCount = 0;
+static const int CHANNELS = 3;   // 固定三通道
+static map<string, double> g_timeAccum;  // 累積 ms
+
 struct CpuTimer {
     string name;
     high_resolution_clock::time_point start;
 
-    CpuTimer(string n) : name(n) {
+    CpuTimer(const string& n) : name(n) {
         start = high_resolution_clock::now();
     }
 
     ~CpuTimer() {
         auto end = high_resolution_clock::now();
-        auto duration = duration_cast<microseconds>(end - start).count();
-        cout << "[" << name << "] Time: " << duration / 1000.0 << " ms" << endl;
+        double ms = duration_cast<microseconds>(end - start).count() / 1000.0;
+
+        // 印出本次時間
+        //cout << "[" << name << "] Time: " << ms << " ms" << endl;
+
+        // 累加
+        g_timeAccum[name] += ms;
     }
 };
 
@@ -128,6 +139,12 @@ void my_dft2D(Mat& complexMat, bool inverse)
 }
 
 Mat wienerDeblur_myfft(const Mat& img, const Mat& psf, float K) {
+    // 只有第一次呼叫時清空累積
+    if (callCount == 0) {
+        g_timeAccum.clear();
+    }
+    callCount++;
+
     // 變數宣告移到區塊外，以便跨區塊使用
     Mat complexI;
     Mat psfComplex;
@@ -227,6 +244,17 @@ Mat wienerDeblur_myfft(const Mat& img, const Mat& psf, float K) {
 
         // normalize for display (optional)
         normalize(finalRestored, finalRestored, 0, 1, NORM_MINMAX);
+    }
+
+    if (callCount == CHANNELS) {
+        cout << "=== Accumulated Time ===" << endl;
+        float this_round_total = 0;
+        for (auto& p : g_timeAccum) {
+            cout << p.first << " total: " << p.second << " ms" << endl;
+            this_round_total += p.second;
+        }
+        cout << "this round total: " << this_round_total << " ms" << endl;
+        cout << "=========================" << endl;
     }
 
     return finalRestored;
