@@ -78,7 +78,6 @@ int main(int argc, char** argv) {
 
     auto t_start_serial = high_resolution_clock::now();
     if (rank == 0) {
-        
         for (int i = 0; i < 3; i++) {
             Mat channel = serial_channels[i];
             if (usePowerOf2) channel = autoPadToPowerOfTwo(channel);

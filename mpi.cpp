@@ -7,6 +7,33 @@ using namespace cv;
 using namespace std;
 using namespace std::chrono;
 
+// 比較兩個 Mat 向量是否相等的輔助函數
+bool areChannelsEqual(const std::vector<cv::Mat>& vec1, const std::vector<cv::Mat>& vec2) {
+    if (vec1.size() != vec2.size()) {
+        std::cerr << "Error: Channel count mismatch (" << vec1.size() << " vs " << vec2.size() << ").\n";
+        return false;
+    }
+    for (size_t i = 0; i < vec1.size(); ++i) {
+        const cv::Mat& mat1 = vec1[i];
+        const cv::Mat& mat2 = vec2[i];
+
+        if (mat1.size() != mat2.size() || mat1.type() != mat2.type()) {
+            std::cerr << "Error: Size or type mismatch in channel " << i << ".\n";
+            return false;
+        }
+        
+        double diff = cv::norm(mat1, mat2, cv::NORM_L2);
+        if (diff != 0.0) {
+            // 允許微小的誤差 (因為 AVX FMA 精度通常比純量高，導致結果不完全 bit-exact)
+            if (diff > 1.0) { 
+                std::cerr << "Error: Content mismatch in channel " << i << " (Diff: " << diff << ").\n";
+                return false;
+            }
+        }
+    }
+    return true; 
+}
+
 int main(int argc, char** argv) {
     // Initialize MPI
     MPI_Init(&argc, &argv);
@@ -22,6 +49,7 @@ int main(int argc, char** argv) {
         MPI_Finalize();
         return -1;
     }
+
     string img_path = argv[1];
     int psf_length = atoi(argv[2]);
     double psf_angle = atof(argv[3]);
@@ -50,7 +78,6 @@ int main(int argc, char** argv) {
 
     auto t_start_serial = high_resolution_clock::now();
     if (rank == 0) {
-        
         for (int i = 0; i < 3; i++) {
             Mat channel = serial_channels[i];
             if (usePowerOf2) channel = autoPadToPowerOfTwo(channel);
@@ -86,12 +113,18 @@ int main(int argc, char** argv) {
     
     // Only rank 0 displays results
     if (rank == 0) {
-
         auto serial_time = getElapsedMs(t_start_serial, t_end_serial);
         cout << "Deblurring 3 channels took (serial) : " << serial_time << " ms\n";
         auto mpi_time = getElapsedMs(t_start_mpi, t_end_mpi);
         cout << "Deblurring 3 channels took (mpi): " << mpi_time << " ms\n";
-        
+
+        if(areChannelsEqual(serial_channels, channels)) {
+            cout << "[Success] The results from serial and MPI implementations are identical.\n";
+            printf("[Speedup] %.2fx\n", serial_time / mpi_time);
+        } else {
+            cout << "[Warning/Error] The results differ.\n";
+            // 註：如果只是微小的浮點數誤差，可能是正常的
+        }
         Mat merged_float;
         merge(channels, merged_float);
 

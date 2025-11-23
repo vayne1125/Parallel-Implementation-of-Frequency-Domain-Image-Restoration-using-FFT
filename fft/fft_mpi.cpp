@@ -8,6 +8,11 @@ using namespace cv;
 using namespace std;
 
 namespace fft_mpi {
+
+static int callCount = 0;
+static const int CHANNELS = 3;   // 固定三通道
+static map<string, double> g_timeAccum;  // 累積 ms
+
 // iterative radix-2 Cooley-Tukey FFT (in-place)
 // a: vector of complex<float>, n must be power-of-two
 // inverse: if true compute inverse transform (no scaling)
@@ -192,6 +197,12 @@ void my_dft2D(Mat& complexMat, int global_rows, int global_cols, bool inverse)
 
 
 Mat wienerDeblur_myfft(const Mat& img, const Mat& psf, float K) {
+    // call count
+    if (callCount == 0) {
+        g_timeAccum.clear();
+    }
+    callCount++;
+
     // MPI
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -199,13 +210,15 @@ Mat wienerDeblur_myfft(const Mat& img, const Mat& psf, float K) {
 
     int global_rows, global_cols, orig_rows, orig_cols;
 
-    // 1) Rank 0
     if (rank == 0) {
         orig_rows = img.rows;
         orig_cols = img.cols;
         global_rows = getOptimalDFTSize(orig_rows);
         global_cols = getOptimalDFTSize(orig_cols);
     }
+    // 1. Preprocessing
+    auto t_start = high_resolution_clock::now();
+
     MPI_Bcast(&global_rows, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&global_cols, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&orig_rows, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -215,7 +228,6 @@ Mat wienerDeblur_myfft(const Mat& img, const Mat& psf, float K) {
     calculate_distribution(global_rows, size, row_counts, row_displs);
     int local_rows = row_counts[rank];
 
-    // 2) Prepare local image Mat
     Mat local_complex_img(local_rows, global_cols, CV_32FC2);
     Mat local_complex_psf(local_rows, global_cols, CV_32FC2);
 
@@ -253,11 +265,27 @@ Mat wienerDeblur_myfft(const Mat& img, const Mat& psf, float K) {
                  local_complex_psf.ptr<float>(), local_rows * global_cols * 2, MPI_FLOAT,
                  0, MPI_COMM_WORLD);
 
-    // 3) Forward DFT on local data
-    my_dft2D(local_complex_img, global_rows, global_cols, false);
-    my_dft2D(local_complex_psf, global_rows, global_cols, false);
+    auto t_end = high_resolution_clock::now();
+    double ms = duration_cast<microseconds>(t_end - t_start).count() / 1000.0;
+    g_timeAccum["MPI: Preprocessing"] += ms;
 
-    // 4) Compute |H|^2 + K (denominator) and H_conj
+    // 2. FFT Image
+    t_start = high_resolution_clock::now();
+    my_dft2D(local_complex_img, global_rows, global_cols, false);
+    t_end = high_resolution_clock::now();
+    ms = duration_cast<microseconds>(t_end - t_start).count() / 1000.0;
+    g_timeAccum["MPI: FFT Image"] += ms;
+
+    // 3. FFT PSF
+    t_start = high_resolution_clock::now();
+    my_dft2D(local_complex_psf, global_rows, global_cols, false);
+    t_end = high_resolution_clock::now();
+    ms = duration_cast<microseconds>(t_end - t_start).count() / 1000.0;
+    g_timeAccum["MPI: FFT PSF"] += ms;
+
+    // 4. Wiener Filter Calculation
+    t_start = high_resolution_clock::now();
+    // Compute |H|^2 + K (denominator) and H_conj
     // H (PSF), G (Image) -> F = G * (conj(H) / (|H|^2 + K))
     for (int r = 0; r < local_rows; ++r) {
         Vec2f* rowG = local_complex_img.ptr<Vec2f>(r);
@@ -274,11 +302,20 @@ Mat wienerDeblur_myfft(const Mat& img, const Mat& psf, float K) {
             rowG[c][1] = val.imag();
         }
     }
+    t_end = high_resolution_clock::now();
+    ms = duration_cast<microseconds>(t_end - t_start).count() / 1000.0;
+    g_timeAccum["MPI: Wiener Filter"] += ms;
 
-    // 5) Inverse DFT on local data
+    // 5. Inverse FFT
+    t_start = high_resolution_clock::now();
     my_dft2D(local_complex_img, global_rows, global_cols, true);
+    t_end = high_resolution_clock::now();
+    ms = duration_cast<microseconds>(t_end - t_start).count() / 1000.0;
+    g_timeAccum["MPI: Inverse FFT"] += ms;
 
-    // 6) Gather results to rank 0
+    // 6. Post-processing
+    t_start = high_resolution_clock::now();
+
     Mat finalRestored;
     if (rank == 0) {
         finalRestored = Mat::zeros(global_rows, global_cols, CV_32FC2);
@@ -302,6 +339,21 @@ Mat wienerDeblur_myfft(const Mat& img, const Mat& psf, float K) {
         normalize(finalRestored, finalRestored, 0, 1, NORM_MINMAX);
         
     }
+    t_end = high_resolution_clock::now();
+    ms = duration_cast<microseconds>(t_end - t_start).count() / 1000.0;
+    g_timeAccum["MPI: Post-processing"] += ms;
+
+    if (rank == 0 && callCount == CHANNELS) {
+        cout << "=== Accumulated Time ===" << endl;
+        float this_round_total = 0;
+        for (auto& p : g_timeAccum) {
+            cout << p.first << " total: " << p.second << " ms" << endl;
+            this_round_total += p.second;
+        }
+        cout << "this round total: " << this_round_total << " ms" << endl;
+        cout << "=========================" << endl;
+    }
+
     return finalRestored;
 }
-}
+} // namespace fft_mpi
