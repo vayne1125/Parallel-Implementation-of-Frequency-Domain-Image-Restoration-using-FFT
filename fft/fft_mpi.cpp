@@ -167,6 +167,116 @@ void distributed_transpose(Mat& localMat, int global_rows, int global_cols)
     }
 
 }
+void distributed_transpose_tiled(Mat& localMat, int global_rows, int global_cols)
+{
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    // 1) Row distribution
+    vector<int> row_counts(size), row_displs(size);
+    calculate_distribution(global_rows, size, row_counts, row_displs);
+    int local_rows = row_counts[rank];
+
+    // 2) Column distribution (row distribution after transpose)
+    vector<int> col_counts(size), col_displs(size);
+    calculate_distribution(global_cols, size, col_counts, col_displs);
+    int new_local_rows = col_counts[rank];
+
+    // ========================================
+    // 3) Prepare send buffer with TILING
+    // ========================================
+    const int TILE_SIZE = 32;
+    
+    vector<float> send_buf(local_rows * global_cols * 2);
+    vector<int> send_counts(size), send_displs(size);
+    
+    // First pass: calculate send_counts and send_displs
+    int buf_idx = 0;
+    for (int p = 0; p < size; ++p) {
+        send_displs[p] = buf_idx;
+        int p_cols_count = col_counts[p];
+        send_counts[p] = local_rows * p_cols_count * 2;
+        buf_idx += send_counts[p];
+    }
+    
+    // Second pass: pack data with tiling
+    for (int p = 0; p < size; ++p) {
+        int p_cols_count = col_counts[p];
+        int p_col_start = col_displs[p];
+        int base_idx = send_displs[p];
+        
+        // Tiled packing
+        for (int r_tile = 0; r_tile < local_rows; r_tile += TILE_SIZE) {
+            int r_end = min(r_tile + TILE_SIZE, local_rows);
+            
+            for (int c_tile = 0; c_tile < p_cols_count; c_tile += TILE_SIZE) {
+                int c_end = min(c_tile + TILE_SIZE, p_cols_count);
+                
+                // Process tile
+                for (int r = r_tile; r < r_end; ++r) {
+                    const float* ptr = localMat.ptr<float>(r);
+                    int idx = base_idx + (r * p_cols_count + c_tile) * 2;
+                    
+                    for (int c = c_tile; c < c_end; ++c) {
+                        int global_c = p_col_start + c;
+                        send_buf[idx++] = ptr[global_c * 2];
+                        send_buf[idx++] = ptr[global_c * 2 + 1];
+                    }
+                }
+            }
+        }
+    }
+    
+    // 4) Prepare recv buffer
+    vector<float> recv_buf(new_local_rows * global_rows * 2);
+    vector<int> recv_counts(size), recv_displs(size);
+    int recv_offset = 0;
+    for (int p = 0; p < size; ++p) {
+        recv_counts[p] = row_counts[p] * new_local_rows * 2;
+        recv_displs[p] = recv_offset;
+        recv_offset += recv_counts[p];
+    }
+
+    // 5) All-to-all communication
+    MPI_Alltoallv(send_buf.data(), send_counts.data(), send_displs.data(), MPI_FLOAT,
+                  recv_buf.data(), recv_counts.data(), recv_displs.data(), MPI_FLOAT,
+                  MPI_COMM_WORLD);
+    
+    // ========================================
+    // 6) Write back to localMat with TILING
+    // ========================================
+    localMat = Mat::zeros(new_local_rows, global_rows, CV_32FC2);
+
+    int global_row_start = 0;
+    
+    for (int p = 0; p < size; ++p) {
+        int src_rows = row_counts[p];
+        int base_idx = recv_displs[p];
+        
+        // Tiled unpacking
+        for (int r_tile = 0; r_tile < src_rows; r_tile += TILE_SIZE) {
+            int r_end = min(r_tile + TILE_SIZE, src_rows);
+            
+            for (int c_tile = 0; c_tile < new_local_rows; c_tile += TILE_SIZE) {
+                int c_end = min(c_tile + TILE_SIZE, new_local_rows);
+                
+                // Process tile
+                for (int r = r_tile; r < r_end; ++r) {
+                    int idx = base_idx + (r * new_local_rows + c_tile) * 2;
+                    
+                    for (int c = c_tile; c < c_end; ++c) {
+                        float re = recv_buf[idx++];
+                        float im = recv_buf[idx++];
+                        localMat.at<Vec2f>(c, global_row_start + r) = Vec2f(re, im);
+                    }
+                }
+            }
+        }
+        
+        global_row_start += src_rows;
+    }
+}
 
 // 2D separable transform: row-wise FFT, transpose, row-wise FFT, transpose back
 // works in-place on CV_32FC2 Mat
@@ -182,7 +292,8 @@ void my_dft2D(Mat& complexMat, int global_rows, int global_cols, bool inverse)
     }
 
     // 2) Distributed transpose
-    distributed_transpose(complexMat, global_rows, global_cols);
+    //distributed_transpose(complexMat, global_rows, global_cols);
+    distributed_transpose_tiled(complexMat, global_rows, global_cols);
     
     // 3) Column-wise transform (Local)
     for (int r = 0; r < complexMat.rows; ++r) {
@@ -191,7 +302,8 @@ void my_dft2D(Mat& complexMat, int global_rows, int global_cols, bool inverse)
     }
 
     // 4) Distributed transpose back
-    distributed_transpose(complexMat, global_cols, global_rows);
+    //distributed_transpose(complexMat, global_cols, global_rows);
+    distributed_transpose_tiled(complexMat, global_cols, global_rows);
 }
 
 
