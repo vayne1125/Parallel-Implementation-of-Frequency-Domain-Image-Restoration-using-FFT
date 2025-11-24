@@ -195,7 +195,7 @@ Mat wienerDeblur_myfft(const Mat& img, const Mat& psf, float K) {
     // 1. 準備資料 (Padding)
     Mat complexI, psfComplex;
     {
-        CpuTimer t("OpenMP: Prep & Padding");
+        // CpuTimer t("OpenMP: Prep & Padding");
         // 這裡包含了 makeComplexPadded 的邏輯
         makeComplexPadded(img, complexI, optRows, optCols);
 
@@ -205,19 +205,19 @@ Mat wienerDeblur_myfft(const Mat& img, const Mat& psf, float K) {
 
     // 2. Forward FFT (Image)
     {
-        CpuTimer t("OpenMP: FFT Image");
+        // CpuTimer t("OpenMP: FFT Image");
         my_dft2D_forward(complexI);
     }
 
     // 3. Forward FFT (PSF)
     {
-        CpuTimer t("OpenMP: FFT PSF");
+        // CpuTimer t("OpenMP: FFT PSF");
         my_dft2D_forward(psfComplex);
     }
 
     // 4. Wiener Filter Calculation
     {
-        CpuTimer t("OpenMP: Wiener Filter");
+        // CpuTimer t("OpenMP: Wiener Filter");
         int rows = complexI.rows;
         int cols = complexI.cols;
 
@@ -245,14 +245,14 @@ Mat wienerDeblur_myfft(const Mat& img, const Mat& psf, float K) {
 
     // 5. Inverse FFT
     {
-        CpuTimer t("OpenMP: IFFT");
+        // CpuTimer t("OpenMP: IFFT");
         my_dft2D_inverse(complexI);
     }
 
     Mat finalRestored;
     // 6. Post-processing
     {
-        CpuTimer t("OpenMP: Post-process");
+        // CpuTimer t("OpenMP: Post-process");
         finalRestored = Mat(img.rows, img.cols, CV_32F);
         
         #pragma omp parallel for

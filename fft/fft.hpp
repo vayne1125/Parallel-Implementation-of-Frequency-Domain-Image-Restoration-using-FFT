@@ -29,6 +29,7 @@ namespace fft_simd {
 }
 
 namespace fft_gpu {
+    void wienerDeblur_RGB_naive(vector<Mat>& channels, const Mat& psf, float K);
     void wienerDeblur_RGB_optimized(vector<Mat>& channels, const Mat& psf, float K);
     // void fft_radix2_inplace(vector<complex<float>>& a, bool inverse);
     void fft_radix2_kernel(float* data, int n, bool inverse);

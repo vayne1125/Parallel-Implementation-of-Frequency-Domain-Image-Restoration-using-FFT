@@ -62,4 +62,4 @@ $(TARGET): $(SRC)
 endif
 
 clean:
-	rm -f mpi simd openmp parallel serial *.o fft/*.o
+	rm -f mpi simd openmp parallel serial gpu *.o fft/*.o

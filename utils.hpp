@@ -30,6 +30,12 @@ inline int nextPowerOfTwo(int n) {
     return p;
 }
 
+inline int getNextPowerOf2(int n) {
+    int p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
 // 自動 padding
 inline Mat autoPadToPowerOfTwo(const Mat& src) {
     int newRows = nextPowerOfTwo(src.rows);
