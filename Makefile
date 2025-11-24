@@ -12,6 +12,11 @@ else ifeq ($(MODE), simd)
     CXXFLAGS += -mavx2 -mfma
     TARGET = simd
     SRC = simd.cpp fft/fft_simd.cpp fft/fft_serial.cpp
+else ifeq ($(MODE), mpi_simd)
+    CXX = mpic++
+    CXXFLAGS += -mavx2 -mfma
+    TARGET = mpi_simd
+    SRC = mpi_simd.cpp fft/fft_mpi_simd.cpp fft/fft_serial.cpp
 else ifeq ($(MODE), openmp)
     CXX = g++
     CXXFLAGS += -fopenmp
@@ -62,4 +67,4 @@ $(TARGET): $(SRC)
 endif
 
 clean:
-	rm -f mpi simd openmp parallel serial gpu *.o fft/*.o
+	rm -f mpi simd mpi_simd openmp parallel serial *.o fft/*.o

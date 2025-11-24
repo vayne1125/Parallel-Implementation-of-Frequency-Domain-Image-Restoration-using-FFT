@@ -46,10 +46,11 @@ int main(int argc, char** argv) {
     int num_threads = atoi(argv[4]);
     // fft_openmp::num_threads = num_threads;
 
-    // int total_threads = num_threads;
-    // int outer_threads = min(3,num_threads);
-    // int inner_threads = total_threads / outer_threads;
-    // if (inner_threads < 1) inner_threads = 1;
+    omp_set_nested(1);
+    int total_threads = num_threads;
+    int outer_threads = min(3,num_threads);
+    int inner_threads = total_threads / 3;
+    if (inner_threads < 1) inner_threads = 1;
 
     cout << "[INFO] " << num_threads << " threads will be used for OpenMP FFT.\n";
     if (num_threads <= 0) {
@@ -86,9 +87,9 @@ int main(int argc, char** argv) {
 
 
     t_start = high_resolution_clock::now();
-    // #pragma omp parallel for num_threads(outer_threads)
+    // #pragma omp parallel for num_threads(total_threads)
     for (int i = 0; i < 3; i++) {
-        omp_set_num_threads(num_threads);
+        omp_set_num_threads(total_threads);
         Mat channel = channels[i];
         if (usePowerOf2) channel = autoPadToPowerOfTwo(channel);
         channels[i] = fft_openmp::wienerDeblur_myfft(channel, psf, K);

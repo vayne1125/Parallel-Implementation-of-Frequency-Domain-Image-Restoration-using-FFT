@@ -37,7 +37,7 @@ bool areChannelsEqual(const std::vector<cv::Mat>& vec1, const std::vector<cv::Ma
 int main(int argc, char** argv) {
     // Initialize MPI
     MPI_Init(&argc, &argv);
-    
+
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
@@ -53,18 +53,18 @@ int main(int argc, char** argv) {
     string img_path = argv[1];
     int psf_length = atoi(argv[2]);
     double psf_angle = atof(argv[3]);
-
-    bool usePowerOf2 = true; 
+    
+    bool usePowerOf2 = true;
 
     // Only rank 0 reads image and prepares data
     Mat img, psf;
     float K = 0.01f;
     vector<Mat> serial_channels;
     vector<Mat> channels;
-    
+
     if (rank == 0) {
         img = imread(img_path, IMREAD_COLOR);
-        if (img.empty()) { 
+        if (img.empty()) {
             cout << "Cannot read image\n"; 
             MPI_Abort(MPI_COMM_WORLD, -1);
         }
@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
     }
     auto t_end_serial = high_resolution_clock::now();
 
-    
+
     // All processes call wienerDeblur_myfft
     // Rank 0 sends data and receives results
     // Workers receive data, process, and send back
@@ -98,33 +98,33 @@ int main(int argc, char** argv) {
             Mat channel = channels[i];
             if (usePowerOf2) channel = autoPadToPowerOfTwo(channel);
 
-            channels[i] = fft_mpi::wienerDeblur_myfft(channel, psf, K);
+            channels[i] = fft_mpi_simd::wienerDeblur_myfft(channel, psf, K);
 
             if (usePowerOf2) channels[i] = channels[i](Rect(0, 0, img.cols, img.rows));
         }
     } else {
         // Workers participate in processing for each channel
         for (int i = 0; i < 3; i++) {
-            fft_mpi::wienerDeblur_myfft(Mat(), Mat(), K);
+            fft_mpi_simd::wienerDeblur_myfft(Mat(), Mat(), K);
         }
     }
     auto t_end_mpi = high_resolution_clock::now();
-    
-    
-    // Only rank 0 displays results
+
+    // Only rank 0 reports timing and verifies results
     if (rank == 0) {
         auto serial_time = getElapsedMs(t_start_serial, t_end_serial);
         cout << "Deblurring 3 channels took (serial) : " << serial_time << " ms\n";
-        auto mpi_time = getElapsedMs(t_start_mpi, t_end_mpi);
-        cout << "Deblurring 3 channels took (mpi): " << mpi_time << " ms\n";
+        auto mpi_simd_time = getElapsedMs(t_start_mpi, t_end_mpi);
+        cout << "Deblurring 3 channels took (mpi_simd): " << mpi_simd_time << " ms\n";
 
         if(areChannelsEqual(serial_channels, channels)) {
             cout << "[Success] The results from serial and MPI implementations are identical.\n";
-            printf("[Speedup] %.2fx\n", serial_time / mpi_time);
+            printf("[Speedup] %.2fx\n", serial_time / mpi_simd_time);
         } else {
             cout << "[Warning/Error] The results differ.\n";
             // 註：如果只是微小的浮點數誤差，可能是正常的
         }
+
         Mat merged_float;
         merge(channels, merged_float);
 
@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
         imshow("Deblurred Color Image", corrected_BGR);
         waitKey(0);
     }
-    
+
     MPI_Finalize();
     return 0;
 }
