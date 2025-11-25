@@ -7,10 +7,10 @@
 ```sh
 clone https://github.com/vayne1125/Parallel-Implementation-of-Frequency-Domain-Image-Restoration-using-FFT.git
 cd Parallel-Implementation-of-Frequency-Domain-Image-Restoration-using-FFT
-make MODE=parallel
-# ./parallel <img-path> <psf-length> <psf-angle>
-./parallel "./input/cat_blurred.png" 50 30 
-./parallel "./input/car_blurred.png" 40 45
+make MODE=gpu
+# ./gpu <img-path> <psf-length> <psf-angle>
+./gpu "./input/cat_blurred.png" 50 30 
+./gpu "./input/car_blurred.png" 40 45
 ```
 
 ### Change parallel mode
@@ -18,7 +18,7 @@ make MODE=parallel
 - simd
 - openmp
 - mpi
-- parallel(fastest)
+- gpu (fastest)
 
 #### SERIAL
 ```sh
@@ -27,17 +27,25 @@ make MODE=serial
 ./serial "./input/cat_blurred.png" 50 30 
 ```
 
+#### GPU
+```sh
+make MODE=gpu
+# ./gpu <img-path> <psf-length> <psf-angle>
+./gpu "./input/cat_blurred.png" 50 30
+```
+
 #### SIMD
 ```sh
 make MODE=simd
-# todo
+# ./simd <img-path> <psf-length> <psf-angle>
+./simd "./input/cat_blurred.png" 50 30
 ```
 
 #### OpenMP
 ```sh
 make MODE=openmp
-# todo
-./openmp "./input/cat_blurred.png" 50 30
+# ./openmp <img-path> <psf-length> <psf-angle> <num-threads>
+./openmp "./input/cat_blurred.png" 50 30 12
 ```
 
 #### MPI
